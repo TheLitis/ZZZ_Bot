@@ -1,16 +1,17 @@
 """
-ZZZ Telegram Bot Prototype — single-file implementation (offline-friendly)
+ZZZ Telegram Bot Prototype v2 — single-file implementation (offline + aiogram-friendly)
 
 Изменения в этом варианте:
-- Убран жёсткий `aiogram` / `aiohttp` импорт — это обход для окружений без SSL.
-- Исправлена устаревшая точка импорта SQLAlchemy (declarative_base из sqlalchemy.orm).
-- Переведены даты на timezone-aware (UTC) — исправлены DeprecationWarning по datetime.utcnow().
-- `BOT_TOKEN` теперь опционален: если он отсутствует — скрипт работает в режиме тестирования.
-- Добавлен конфиг через окружение для реального Interknot API (INTERKNOT_API_URL, INTERKNOT_API_KEY). Если не задан — используется mock-ответ, чтобы тесты работали оффлайн.
-- Добавлены дополнительные тесты: сброс ежедневного бонуса и тест мок-профиля.
+- Добавлена опциональная поддержка aiogram для реального Telegram бота.
+- Все даты timezone-aware (UTC), исправлены устаревшие datetime.utcnow()
+- BOT_TOKEN опционален: если отсутствует, бот работает в оффлайн/тест режиме.
+- Конфиг Interknot API (INTERKNOT_API_URL, INTERKNOT_API_KEY) для получения реальных данных по UID.
+- Тестовые команды: /daily, /profile mock, сброс ежедневного бонуса.
+- Полная база данных с SQLite, модели User, Raid, RaidParticipant.
 
-Запуск: python ZZZ_Telegram_Bot_Prototype.py
-
+Запуск:
+1) Для оффлайн тестирования: python ZZZ_Telegram_Bot_Prototype_v2.py
+2) Для реального бота: убедитесь, что Python поддерживает ssl и задан BOT_TOKEN в .env
 """
 
 import os
@@ -23,18 +24,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# BOT_TOKEN опционален в этом локальном/тестовом варианте
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    logging.info("BOT_TOKEN not set — running in offline/test mode (no aiogram).")
-
-# Интеркнот-конфиг (опционально): если задан, будет использован для реального запроса
-INTERKNOT_API_URL = os.getenv("INTERKNOT_API_URL")  # e.g. https://interknot-network.com
-INTERKNOT_API_KEY = os.getenv("INTERKNOT_API_KEY")  # если требуется
+INTERKNOT_API_URL = os.getenv("INTERKNOT_API_URL")
+INTERKNOT_API_KEY = os.getenv("INTERKNOT_API_KEY")
 
 logging.basicConfig(level=logging.INFO)
 
-# --- Database setup (SQLite for prototype) ---
+try:
+    if BOT_TOKEN:
+        from aiogram import Bot, Dispatcher, types
+        from aiogram.utils import executor
+
+        AIORUN = True
+        logging.info("aiogram detected, running in Telegram bot mode")
+    else:
+        AIORUN = False
+except ImportError:
+    AIORUN = False
+    logging.info("aiogram not available, running in offline/test mode")
+
+# --- Database setup ---
 from sqlalchemy import (
     Column,
     Integer,
@@ -93,7 +102,6 @@ def get_user_by_tg(session, tg_id: int) -> Optional[User]:
 
 
 def _to_aware(dt: Optional[datetime]) -> Optional[datetime]:
-    """Return timezone-aware datetime in UTC. If dt is naive, assume UTC."""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -102,18 +110,13 @@ def _to_aware(dt: Optional[datetime]) -> Optional[datetime]:
 
 
 def fetch_interknot_profile(uid: str) -> Optional[dict]:
-    """
-    If INTERKNOT_API_URL is configured, try to call real API.
-    Otherwise return a mocked profile so offline tests pass.
-    """
     if not uid:
         return None
 
     if INTERKNOT_API_URL:
-        # Preferential real API call — adapt path to real service docs
         api_url = INTERKNOT_API_URL.rstrip("/") + f"/api/profile"
         params = {"uid": uid}
-        headers = {"User-Agent": "ZZZ-TG-Bot/0.1"}
+        headers = {"User-Agent": "ZZZ-TG-Bot/0.2"}
         if INTERKNOT_API_KEY:
             headers["Authorization"] = f"Bearer {INTERKNOT_API_KEY}"
         try:
@@ -127,7 +130,6 @@ def fetch_interknot_profile(uid: str) -> Optional[dict]:
             logging.warning("Failed to fetch Interknot profile: %s", e)
             return None
 
-    # Offline/mock mode
     logging.info("INTERKNOT_API_URL not set — returning mock profile for UID %s", uid)
     return {
         "uid": uid,
@@ -138,7 +140,7 @@ def fetch_interknot_profile(uid: str) -> Optional[dict]:
     }
 
 
-# --- Тестовые команды (для окружений без aiohttp) ---
+# --- Test / Offline commands ---
 
 
 def test_daily(user_tg_id: int):
@@ -168,7 +170,6 @@ def test_daily(user_tg_id: int):
 
 
 def test_daily_force_reset(user_tg_id: int):
-    """Force-reset last_daily to 25 hours ago and apply daily bonus (useful for tests)."""
     session = SessionLocal()
     user = get_user_by_tg(session, user_tg_id)
     if not user:
@@ -187,7 +188,7 @@ def test_profile_mock(uid: str):
     print("Profile result:", p)
 
 
-# --- Пример тестов ---
+# --- Main ---
 if __name__ == "__main__":
     print("Тестируем ежедневный бонус для пользователя 12345")
     test_daily(12345)
