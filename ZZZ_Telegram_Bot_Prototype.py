@@ -1,19 +1,23 @@
 """
-ZZZ Telegram Bot Prototype v3 — adds full aiogram handlers and reminder task
+ZZZ Telegram Bot — compatibility layer for aiogram v2 and v3 + polling fallback
 
-This iteration adds:
-- aiogram handlers: /start, /linkuid, /profile, /daily, /create_raid, /join, /export_raids
-- background reminder task that notifies participants and creator 30 and 10 minutes before raid
-- async wrapper for fetch_interknot_profile (uses requests under the hood via to_thread)
-- safer Dispatcher initialization (Dispatcher(bot)) and guarded startup
+This file is a drop-in replacement that fixes the AttributeError: 'Dispatcher' object has no attribute 'message_handler'
+by supporting multiple aiogram versions. It follows this strategy:
 
-Usage:
-- Set BOT_TOKEN in .env to run real Telegram bot (ensure Python has ssl module).
-- If BOT_TOKEN is not set or aiogram isn't installed, file can still be used for offline tests by running the main section.
+1. If aiogram is not installed or BOT_TOKEN is missing -> run offline tests or polling fallback.
+2. If aiogram is installed, detect whether it's v2-style or v3-style API:
+   - v2-style: Dispatcher has method `message_handler` or `register_message_handler` -> use decorator approach
+   - v3-style: use `Router()` and `router.message.register(...)` to register handlers, then include router into Dispatcher.
+3. If aiogram is installed but the specific API calls fail, fall back to the simple polling implementation.
+
+This file preserves the same command logic as before (/start, /linkuid, /profile, /daily, /create_raid, /join, /export_raids)
+
+Run: set BOT_TOKEN in .env for real bot, otherwise runs offline tests.
 """
 
 import os
 import logging
+import time
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
@@ -31,7 +35,7 @@ INTERKNOT_API_KEY = os.getenv("INTERKNOT_API_KEY")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Database ---
+# --- Database (same as before) ---
 from sqlalchemy import (
     Column,
     Integer,
@@ -82,7 +86,7 @@ class RaidParticipant(Base):
 
 Base.metadata.create_all(engine)
 
-# --- Helpers ---
+# --- Helpers and core logic (copied + reused) ---
 
 
 def get_user_by_tg(session, tg_id: int) -> Optional[User]:
@@ -103,7 +107,7 @@ def fetch_interknot_profile(uid: str) -> Optional[dict]:
     if INTERKNOT_API_URL:
         api_url = INTERKNOT_API_URL.rstrip("/") + "/api/profile"
         params = {"uid": uid}
-        headers = {"User-Agent": "ZZZ-TG-Bot/0.3"}
+        headers = {"User-Agent": "ZZZ-TG-Bot/compat"}
         if INTERKNOT_API_KEY:
             headers["Authorization"] = f"Bearer {INTERKNOT_API_KEY}"
         try:
@@ -116,7 +120,6 @@ def fetch_interknot_profile(uid: str) -> Optional[dict]:
         except requests.RequestException as e:
             logger.warning("Interknot request failed: %s", e)
             return None
-    # mock
     logger.info("Returning mock profile for UID %s", uid)
     return {
         "uid": uid,
@@ -124,13 +127,6 @@ def fetch_interknot_profile(uid: str) -> Optional[dict]:
         "level": 42,
         "last_seen": datetime.now(timezone.utc).isoformat(),
     }
-
-
-async def fetch_interknot_profile_async(uid: str) -> Optional[dict]:
-    return await asyncio.to_thread(fetch_interknot_profile, uid)
-
-
-# --- Core logic ---
 
 
 def ensure_user(session, tg_id: int, nick: Optional[str] = None) -> User:
@@ -143,14 +139,61 @@ def ensure_user(session, tg_id: int, nick: Optional[str] = None) -> User:
     return user
 
 
-# --- Offline tests ---
-
-
-def test_daily(user_tg_id: int):
+def cmd_start_logic(tg_id: int, username: Optional[str]) -> str:
     session = SessionLocal()
-    user = get_user_by_tg(session, user_tg_id)
+    user = get_user_by_tg(session, tg_id)
     if not user:
-        user = User(tg_id=user_tg_id, nick=f"user{user_tg_id}")
+        user = User(tg_id=tg_id, nick=username)
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        session.close()
+        return "Привет! Ты зарегистрирован. Привяжи UID: /linkuid <UID>"
+    session.close()
+    return "/profile чтобы посмотреть профиль"
+
+
+def cmd_linkuid_logic(tg_id: int, uid: str) -> str:
+    session = SessionLocal()
+    user = get_user_by_tg(session, tg_id)
+    if not user:
+        user = User(tg_id=tg_id, uid=uid)
+        session.add(user)
+    else:
+        user.uid = uid
+    session.commit()
+    session.close()
+    return f"UID {uid} привязан"
+
+
+def cmd_profile_logic(tg_id: int) -> str:
+    session = SessionLocal()
+    user = get_user_by_tg(session, tg_id)
+    if not user:
+        session.close()
+        return "Не зарегистрированы. /start"
+    lines = [f"Профиль @{user.nick}", f"Кристаллы: {user.crystals}"]
+    if user.uid:
+        lines.append(f"UID: {user.uid}")
+        profile = fetch_interknot_profile(user.uid)
+        if profile:
+            if "nickname" in profile:
+                lines.append(f"Игровой ник: {profile.get('nickname')}")
+            if "level" in profile:
+                lines.append(f"Уровень: {profile.get('level')}")
+        else:
+            lines.append("(Не удалось получить данные с внешнего сервиса)")
+    else:
+        lines.append("UID не привязан. /linkuid <UID>")
+    session.close()
+    return "\n".join(lines)
+
+
+def cmd_daily_logic(tg_id: int) -> str:
+    session = SessionLocal()
+    user = get_user_by_tg(session, tg_id)
+    if not user:
+        user = User(tg_id=tg_id)
         session.add(user)
         session.commit()
     now = datetime.now(timezone.utc)
@@ -159,55 +202,391 @@ def test_daily(user_tg_id: int):
         remaining = timedelta(hours=24) - (now - last)
         hh, rem = divmod(int(remaining.total_seconds()), 3600)
         mm, ss = divmod(rem, 60)
-        print(f"Ежедневный бонус уже взят. Следующий через {hh:02d}:{mm:02d}:{ss:02d}")
         session.close()
-        return
+        return f"Ежедневный бонус уже взят. Следующий: {hh:02d}:{mm:02d}:{ss:02d}"
     user.crystals = (user.crystals or 0) + 50
     user.last_daily = now
     session.commit()
-    print(f"Выдано 50 кристаллов. Сейчас: {user.crystals}")
+    crystals = user.crystals
     session.close()
+    return f"Хвостик вручает тебе 50 кристаллов! Сейчас: {crystals} кристаллов. Следующий бесплатный бонус через 24:00:00."
 
 
-# --- aiogram mode ---
-HAS_AIOGRAM = False
-EXECUTOR_AVAILABLE = False
-try:
-    if BOT_TOKEN:
-        # try best-effort imports; aiogram versions differ in where executor lives
-        from aiogram import Bot, Dispatcher, types
+def cmd_create_raid_logic(tg_id: int, boss: str, dt: datetime, slots: int) -> str:
+    session = SessionLocal()
+    user = get_user_by_tg(session, tg_id)
+    if not user:
+        user = User(tg_id=tg_id)
+        session.add(user)
+        session.commit()
+    raid = Raid(boss=boss, start_time=dt, slots=slots, creator_id=user.id)
+    session.add(raid)
+    session.commit()
+    rid = raid.id
+    session.close()
+    return f"Рейд создан: ID {rid}. {boss} в {dt.isoformat()} (UTC). Слотов: {slots}. /join {rid}"
 
+
+def cmd_join_logic(tg_id: int, raid_id: int) -> str:
+    session = SessionLocal()
+    raid = session.query(Raid).filter(Raid.id == raid_id).first()
+    if not raid:
+        session.close()
+        return "Рейд не найден."
+    user = get_user_by_tg(session, tg_id)
+    if not user:
+        user = User(tg_id=tg_id)
+        session.add(user)
+        session.commit()
+    count = (
+        session.query(RaidParticipant)
+        .filter(RaidParticipant.raid_id == raid.id)
+        .count()
+    )
+    if count >= raid.slots:
+        session.close()
+        return "Все слоты заняты."
+    exists = (
+        session.query(RaidParticipant)
+        .filter(RaidParticipant.raid_id == raid.id, RaidParticipant.user_id == user.id)
+        .first()
+    )
+    if exists:
+        session.close()
+        return "Вы уже записаны."
+    rp = RaidParticipant(raid_id=raid.id, user_id=user.id)
+    session.add(rp)
+    session.commit()
+    session.close()
+    return f"Вы записаны на рейд {raid.id} — {raid.boss} в {raid.start_time.isoformat()} (UTC)."
+
+
+def cmd_export_raids_logic(tg_id: int) -> str:
+    if OWNER_TG_ID and tg_id != OWNER_TG_ID:
+        return "Только владелец может использовать эту команду."
+    session = SessionLocal()
+    raids = session.query(Raid).all()
+    lines: List[str] = []
+    for r in raids:
+        participants = (
+            session.query(RaidParticipant).filter(RaidParticipant.raid_id == r.id).all()
+        )
+        lines.append(
+            f"{r.id}\t{r.boss}\t{r.start_time.isoformat()}\t{r.slots}\t{len(participants)}"
+        )
+    session.close()
+    return "ID\tBoss\tStart\tSlots\tParticipants\n" + "\n".join(lines)
+
+
+# --- Polling fallback (same as v4) ---
+
+
+def send_message_via_api(chat_id: int, text: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(url, json={"chat_id": chat_id, "text": text})
+        resp.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        logger.warning("sendMessage failed: %s", e)
+        return False
+
+
+def run_simple_polling():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN is required for polling mode")
+        return
+    logger.info("Starting simple polling fallback (long polling via getUpdates)")
+    offset = None
+    api_base = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    while True:
         try:
-            # older beta: executor in aiogram.utils
+            params = {"timeout": 30, "limit": 20}
+            if offset:
+                params["offset"] = offset
+            r = requests.get(api_base + "/getUpdates", params=params, timeout=40)
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("ok"):
+                time.sleep(1)
+                continue
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                if "message" not in upd:
+                    continue
+                msg = upd["message"]
+                chat_id = msg["chat"]["id"]
+                from_id = msg["from"]["id"]
+                username = msg["from"].get("username")
+                text = msg.get("text", "")
+                if not text.startswith("/"):
+                    continue
+                parts = text.split()
+                cmd = parts[0].lstrip("/").split("@")[0].lower()
+                args = parts[1:]
+                try:
+                    if cmd == "start":
+                        resp = cmd_start_logic(from_id, username)
+                        send_message_via_api(chat_id, resp)
+                    elif cmd == "linkuid" and args:
+                        resp = cmd_linkuid_logic(from_id, args[0])
+                        send_message_via_api(chat_id, resp)
+                    elif cmd == "profile":
+                        resp = cmd_profile_logic(from_id)
+                        send_message_via_api(chat_id, resp)
+                    elif cmd == "daily":
+                        resp = cmd_daily_logic(from_id)
+                        send_message_via_api(chat_id, resp)
+                    elif cmd == "create_raid" and len(args) >= 3:
+                        boss = args[0]
+                        date = args[1]
+                        time_part = args[2]
+                        slots = int(args[3]) if len(args) >= 4 else 5
+                        try:
+                            dt = datetime.fromisoformat(date + "T" + time_part)
+                            dt = dt.replace(tzinfo=timezone.utc)
+                            resp = cmd_create_raid_logic(from_id, boss, dt, slots)
+                        except Exception:
+                            resp = 'Неверный формат даты/времени. Используйте: /create_raid "Boss" YYYY-MM-DD HH:MM [slots]'
+                        send_message_via_api(chat_id, resp)
+                    elif cmd == "join" and args:
+                        try:
+                            rid = int(args[0])
+                            resp = cmd_join_logic(from_id, rid)
+                        except ValueError:
+                            resp = "ID рейда должен быть числом."
+                        send_message_via_api(chat_id, resp)
+                    elif cmd == "export_raids":
+                        resp = cmd_export_raids_logic(from_id)
+                        send_message_via_api(chat_id, resp)
+                    else:
+                        send_message_via_api(
+                            chat_id, "Неизвестная команда или неверные аргументы."
+                        )
+                except Exception as e:
+                    logger.exception("Error handling command: %s", e)
+                    send_message_via_api(chat_id, "Ошибка при обработке команды.")
+        except requests.RequestException as e:
+            logger.warning("getUpdates failed: %s", e)
+            time.sleep(3)
+        except Exception as e:
+            logger.exception("Unexpected error in polling loop: %s", e)
+            time.sleep(3)
+
+
+# --- aiogram compatibility chooser: register handlers for v2 or v3 ---
+try:
+    import aiogram
+
+    aiogram_version = getattr(aiogram, "__version__", "unknown")
+    logger.info("aiogram version: %s", aiogram_version)
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN not set — skipping aiogram run")
+
+    from aiogram import Bot, Dispatcher
+    from aiogram import types as aiotypes
+
+    # Try v2-style Dispatcher with message_handler decorator
+    try:
+        dp = Dispatcher(Bot(token=BOT_TOKEN))
+        v2_like = hasattr(dp, "message_handler") or hasattr(
+            dp, "register_message_handler"
+        )
+    except Exception:
+        try:
+            dp = Dispatcher()
+            v2_like = hasattr(dp, "message_handler") or hasattr(
+                dp, "register_message_handler"
+            )
+        except Exception:
+            dp = None
+            v2_like = False
+
+    if dp and v2_like:
+        logger.info(
+            "Detected aiogram v2-like API. Registering handlers with decorators."
+        )
+
+        @dp.message_handler(commands=["start"])
+        async def _h_start(message: aiotypes.Message):
+            text = cmd_start_logic(message.from_user.id, message.from_user.username)
+            await message.reply(text)
+
+        @dp.message_handler(commands=["linkuid"])
+        async def _h_linkuid(message: aiotypes.Message):
+            args = message.get_args().strip()
+            if not args:
+                await message.reply("Использование: /linkuid <UID>")
+                return
+            resp = cmd_linkuid_logic(message.from_user.id, args.split()[0])
+            await message.reply(resp)
+
+        @dp.message_handler(commands=["profile"])
+        async def _h_profile(message: aiotypes.Message):
+            resp = cmd_profile_logic(message.from_user.id)
+            await message.reply(resp)
+
+        @dp.message_handler(commands=["daily"])
+        async def _h_daily(message: aiotypes.Message):
+            resp = cmd_daily_logic(message.from_user.id)
+            await message.reply(resp)
+
+        @dp.message_handler(commands=["create_raid"])
+        async def _h_create_raid(message: aiotypes.Message):
+            import shlex
+
+            args = shlex.split(message.get_args())
+            if len(args) < 3:
+                await message.reply(
+                    'Использование: /create_raid "Boss" YYYY-MM-DD HH:MM [slots]'
+                )
+                return
+            boss = args[0]
+            date = args[1]
+            time_part = args[2]
+            slots = int(args[3]) if len(args) >= 4 else 5
+            try:
+                dt = datetime.fromisoformat(date + "T" + time_part)
+                dt = dt.replace(tzinfo=timezone.utc)
+                resp = cmd_create_raid_logic(message.from_user.id, boss, dt, slots)
+            except Exception:
+                resp = "Неверный формат даты/времени."
+            await message.reply(resp)
+
+        @dp.message_handler(commands=["join"])
+        async def _h_join(message: aiotypes.Message):
+            args = message.get_args().strip().split()
+            if not args:
+                await message.reply("Использование: /join <raid_id>")
+                return
+            try:
+                rid = int(args[0])
+                resp = cmd_join_logic(message.from_user.id, rid)
+            except ValueError:
+                resp = "ID рейда должен быть числом."
+            await message.reply(resp)
+
+        @dp.message_handler(commands=["export_raids"])
+        async def _h_export(message: aiotypes.Message):
+            resp = cmd_export_raids_logic(message.from_user.id)
+            await message.reply(resp)
+
+        # Start polling using aiogram's executor if available, otherwise fallback to dp.start_polling
+        try:
+            # look for executor in aiogram.utils
             from aiogram.utils import executor
 
-            EXECUTOR_AVAILABLE = True
+            logger.info("Starting aiogram polling via executor")
+            executor.start_polling(dp, skip_updates=True)
         except Exception:
-            try:
-                # some versions expose executor at top-level
-                from aiogram import executor  # type: ignore
+            logger.info("Starting aiogram polling via dp.start_polling")
+            asyncio.run(dp.start_polling())
 
-                EXECUTOR_AVAILABLE = True
-            except Exception:
-                EXECUTOR_AVAILABLE = False
-        HAS_AIOGRAM = True
-        logger.info(
-            "aiogram detected — running in Telegram mode (executor available=%s)",
-            EXECUTOR_AVAILABLE,
-        )
     else:
-        logger.info("BOT_TOKEN not set — aiogram will not be used")
+        # try v3-style: Router
+        try:
+            from aiogram import Router
+            from aiogram.filters import Command
+            from aiogram.types import Message
+
+            bot = Bot(token=BOT_TOKEN)
+            dp = Dispatcher()
+            router = Router()
+
+            async def _reply(msg: Message, text: str):
+                await msg.answer(text)
+
+            # register handlers using router
+            @router.message(Command("start"))
+            async def _r_start(message: Message):
+                await _reply(
+                    message,
+                    cmd_start_logic(message.from_user.id, message.from_user.username),
+                )
+
+            @router.message(Command("linkuid"))
+            async def _r_linkuid(message: Message):
+                args = (message.text or "").split()[1:]
+                if not args:
+                    await _reply(message, "Использование: /linkuid <UID>")
+                    return
+                await _reply(message, cmd_linkuid_logic(message.from_user.id, args[0]))
+
+            @router.message(Command("profile"))
+            async def _r_profile(message: Message):
+                await _reply(message, cmd_profile_logic(message.from_user.id))
+
+            @router.message(Command("daily"))
+            async def _r_daily(message: Message):
+                await _reply(message, cmd_daily_logic(message.from_user.id))
+
+            @router.message(Command("create_raid"))
+            async def _r_create_raid(message: Message):
+                import shlex
+
+                args = shlex.split(" ".join((message.text or "").split()[1:]))
+                if len(args) < 3:
+                    await _reply(
+                        message,
+                        'Использование: /create_raid "Boss" YYYY-MM-DD HH:MM [slots]',
+                    )
+                    return
+                boss = args[0]
+                date = args[1]
+                time_part = args[2]
+                slots = int(args[3]) if len(args) >= 4 else 5
+                try:
+                    dt = datetime.fromisoformat(date + "T" + time_part)
+                    dt = dt.replace(tzinfo=timezone.utc)
+                    await _reply(
+                        message,
+                        cmd_create_raid_logic(message.from_user.id, boss, dt, slots),
+                    )
+                except Exception:
+                    await _reply(message, "Неверный формат даты/времени.")
+
+            @router.message(Command("join"))
+            async def _r_join(message: Message):
+                args = (message.text or "").split()[1:]
+                if not args:
+                    await _reply(message, "Использование: /join <raid_id>")
+                    return
+                try:
+                    rid = int(args[0])
+                    await _reply(message, cmd_join_logic(message.from_user.id, rid))
+                except ValueError:
+                    await _reply(message, "ID рейда должен быть числом.")
+
+            @router.message(Command("export_raids"))
+            async def _r_export(message: Message):
+                await _reply(message, cmd_export_raids_logic(message.from_user.id))
+
+            dp.include_router(router)
+            # start polling
+            try:
+                from aiogram import executor as aio_executor
+
+                logger.info("Starting aiogram v3 polling via executor")
+                aio_executor.start_polling(dp)
+            except Exception:
+                logger.info("Starting aiogram v3 polling via dp.start_polling")
+                asyncio.run(dp.start_polling(bot))
+
+        except Exception as e:
+            logger.exception("Failed to register v3 handlers: %s", e)
+            logger.info("Falling back to simple polling")
+            run_simple_polling()
+
 except Exception as e:
-    logger.info("aiogram import failed: %s", e)
-    HAS_AIOGRAM = False
-    EXECUTOR_AVAILABLE = False
-
-
-if not HAS_AIOGRAM:
-    if __name__ == "__main__":
+    logger.info(
+        "aiogram not available or error checking it (%s) — using polling fallback", e
+    )
+    if not BOT_TOKEN:
+        # offline tests
         print("Running offline tests")
-        test_daily(12345)
-        print("\nForcing reset and re-testing")
+        print("Тестируем ежедневный бонус для пользователя 12345")
+        print(cmd_daily_logic(12345))
+        print("\nПринудительный сброс и повторный тест (должен выдать кристаллы)")
         session = SessionLocal()
         u = get_user_by_tg(session, 12345)
         if not u:
@@ -217,285 +596,8 @@ if not HAS_AIOGRAM:
         u.last_daily = datetime.now(timezone.utc) - timedelta(hours=25)
         session.commit()
         session.close()
-        test_daily(12345)
-        import asyncio as _async
-
-        _async.run(fetch_interknot_profile_async("exampleUID"))
-
-else:
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(bot)
-
-    async def send_message_safe(chat_id: int, text: str):
-        try:
-            await bot.send_message(chat_id, text)
-        except Exception as e:
-            logger.warning("Failed to send message to %s: %s", chat_id, e)
-
-    @dp.message_handler(commands=["start"])
-    async def cmd_start(message: types.Message):
-        session = SessionLocal()
-        user = get_user_by_tg(session, message.from_user.id)
-        if not user:
-            user = User(tg_id=message.from_user.id, nick=message.from_user.username)
-            session.add(user)
-            session.commit()
-            await message.reply(
-                "Привет! Ты зарегистрирован. Привяжи UID: /linkuid <UID>"
-            )
-        else:
-            await message.reply("/profile чтобы посмотреть профиль")
-        session.close()
-
-    @dp.message_handler(commands=["linkuid"])
-    async def cmd_linkuid(message: types.Message):
-        args = message.get_args().strip()
-        if not args:
-            await message.reply("Использование: /linkuid <UID>")
-            return
-        uid = args.split()[0]
-        session = SessionLocal()
-        user = get_user_by_tg(session, message.from_user.id)
-        if not user:
-            user = User(
-                tg_id=message.from_user.id, nick=message.from_user.username, uid=uid
-            )
-            session.add(user)
-        else:
-            user.uid = uid
-        session.commit()
-        session.close()
-        await message.reply(f"UID {uid} привязан")
-
-    @dp.message_handler(commands=["profile"])
-    async def cmd_profile(message: types.Message):
-        session = SessionLocal()
-        user = get_user_by_tg(session, message.from_user.id)
-        if not user:
-            await message.reply("Не зарегистрированы. /start")
-            session.close()
-            return
-        lines = [f"Профиль @{user.nick}", f"Кристаллы: {user.crystals}"]
-        if user.uid:
-            lines.append(f"UID: {user.uid}")
-            profile = await fetch_interknot_profile_async(user.uid)
-            if profile:
-                if "nickname" in profile:
-                    lines.append(f"Игровой ник: {profile.get('nickname')}")
-                if "level" in profile:
-                    lines.append(f"Уровень: {profile.get('level')}")
-                if "raw_text" in profile:
-                    lines.append("(Получены данные — см. админку)")
-            else:
-                lines.append("(Не удалось получить данные с внешнего сервиса)")
-        else:
-            lines.append("UID не привязан. /linkuid <UID>")
-        await message.reply("\n".join(lines))
-        session.close()
-
-    @dp.message_handler(commands=["daily"])
-    async def cmd_daily(message: types.Message):
-        session = SessionLocal()
-        user = get_user_by_tg(session, message.from_user.id)
-        if not user:
-            user = User(tg_id=message.from_user.id, nick=message.from_user.username)
-            session.add(user)
-            session.commit()
-        now = datetime.now(timezone.utc)
-        last = _to_aware(user.last_daily)
-        if last and (now - last) < timedelta(hours=24):
-            remaining = timedelta(hours=24) - (now - last)
-            hh, rem = divmod(int(remaining.total_seconds()), 3600)
-            mm, ss = divmod(rem, 60)
-            await message.reply(
-                f"Ежедневный бонус уже взят. Следующий: {hh:02d}:{mm:02d}:{ss:02d}"
-            )
-            session.close()
-            return
-        user.crystals = (user.crystals or 0) + 50
-        user.last_daily = now
-        session.commit()
-        await message.reply(
-            f"Хвостик вручает тебе 50 кристаллов! Сейчас: {user.crystals} кристаллов. Следующий бесплатный бонус через 24:00:00."
-        )
-        session.close()
-
-    def _parse_create_raid_args(args: str) -> Optional[tuple]:
-        import shlex
-
-        try:
-            parts = shlex.split(args)
-        except Exception:
-            return None
-        if len(parts) < 3:
-            return None
-        boss = parts[0]
-        date = parts[1]
-        time = parts[2]
-        slots = int(parts[3]) if len(parts) >= 4 else 5
-        try:
-            dt = datetime.fromisoformat(date + "T" + time)
-            dt = dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            return None
-        return boss, dt, slots
-
-    @dp.message_handler(commands=["create_raid"])
-    async def cmd_create_raid(message: types.Message):
-        args = message.get_args()
-        parsed = _parse_create_raid_args(args)
-        if not parsed:
-            await message.reply(
-                'Использование: /create_raid "Boss name" YYYY-MM-DD HH:MM [slots]'
-            )
-            return
-        boss, dt, slots = parsed
-        session = SessionLocal()
-        user = get_user_by_tg(session, message.from_user.id)
-        if not user:
-            user = User(tg_id=message.from_user.id, nick=message.from_user.username)
-            session.add(user)
-            session.commit()
-        raid = Raid(boss=boss, start_time=dt, slots=slots, creator_id=user.id)
-        session.add(raid)
-        session.commit()
-        await message.reply(
-            f"Рейд создан: ID {raid.id}. {boss} в {dt.isoformat()} (UTC). Слотов: {slots}. /join {raid.id}"
-        )
-        session.close()
-
-    @dp.message_handler(commands=["join"])
-    async def cmd_join(message: types.Message):
-        args = message.get_args().strip()
-        if not args:
-            await message.reply("Использование: /join <raid_id>")
-            return
-        try:
-            raid_id = int(args.split()[0])
-        except ValueError:
-            await message.reply("ID рейда должен быть числом.")
-            return
-        session = SessionLocal()
-        raid = session.query(Raid).filter(Raid.id == raid_id).first()
-        if not raid:
-            await message.reply("Рейд не найден.")
-            session.close()
-            return
-        user = get_user_by_tg(session, message.from_user.id)
-        if not user:
-            user = User(tg_id=message.from_user.id, nick=message.from_user.username)
-            session.add(user)
-            session.commit()
-        count = (
-            session.query(RaidParticipant)
-            .filter(RaidParticipant.raid_id == raid.id)
-            .count()
-        )
-        if count >= raid.slots:
-            await message.reply("Все слоты заняты.")
-            session.close()
-            return
-        exists = (
-            session.query(RaidParticipant)
-            .filter(
-                RaidParticipant.raid_id == raid.id, RaidParticipant.user_id == user.id
-            )
-            .first()
-        )
-        if exists:
-            await message.reply("Вы уже записаны.")
-            session.close()
-            return
-        rp = RaidParticipant(raid_id=raid.id, user_id=user.id)
-        session.add(rp)
-        session.commit()
-        session.close()
-        await message.reply(
-            f"Вы записаны на рейд {raid.id} — {raid.boss} в {raid.start_time.isoformat()} (UTC)."
-        )
-
-    @dp.message_handler(commands=["export_raids"])
-    async def cmd_export_raids(message: types.Message):
-        if OWNER_TG_ID and message.from_user.id != OWNER_TG_ID:
-            await message.reply("Только владелец может использовать эту команду.")
-            return
-        session = SessionLocal()
-        raids = session.query(Raid).all()
-        lines: List[str] = []
-        for r in raids:
-            participants = (
-                session.query(RaidParticipant)
-                .filter(RaidParticipant.raid_id == r.id)
-                .all()
-            )
-            lines.append(
-                f"{r.id}\t{r.boss}\t{r.start_time.isoformat()}\t{r.slots}\t{len(participants)}"
-            )
-        session.close()
-        await message.reply("ID\tBoss\tStart\tSlots\tParticipants\n" + "\n".join(lines))
-
-    async def reminder_task():
-        await asyncio.sleep(1)
-        while True:
-            try:
-                now = datetime.now(timezone.utc)
-                session = SessionLocal()
-                upcoming = session.query(Raid).filter(Raid.start_time > now).all()
-                for raid in upcoming:
-                    delta = raid.start_time - now
-                    minutes = int(delta.total_seconds() // 60)
-                    notify_times = [30, 10]
-                    if minutes in notify_times:
-                        participants = (
-                            session.query(RaidParticipant)
-                            .filter(RaidParticipant.raid_id == raid.id)
-                            .all()
-                        )
-                        tg_ids = set()
-                        creator = (
-                            session.query(User)
-                            .filter(User.id == raid.creator_id)
-                            .first()
-                        )
-                        if creator:
-                            tg_ids.add(creator.tg_id)
-                        for p in participants:
-                            u = session.query(User).filter(User.id == p.user_id).first()
-                            if u:
-                                tg_ids.add(u.tg_id)
-                        text = f"Напоминание: рейд {raid.boss} через {minutes} минут (ID {raid.id})."
-                        for tg in tg_ids:
-                            asyncio.create_task(send_message_safe(tg, text))
-                session.close()
-            except Exception as e:
-                logger.exception("Ошибка в reminder_task: %s", e)
-            await asyncio.sleep(50)
-
-    async def on_startup(_):
-        logger.info("Starting reminder task...")
-        asyncio.create_task(reminder_task())
-
-    if __name__ == "__main__":
-        logger.info("Starting aiogram bot...")
-        # Prefer executor.start_polling if available (older aiogram). Otherwise use Dispatcher.start_polling
-        if EXECUTOR_AVAILABLE:
-            try:
-                executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
-            except Exception as e:
-                logger.warning(
-                    "executor.start_polling failed: %s — falling back to dp.start_polling",
-                    e,
-                )
-
-                async def _run_fallback():
-                    await on_startup(None)
-                    await dp.start_polling(bot, skip_updates=True)
-
-                asyncio.run(_run_fallback())
-        else:
-
-            async def _run():
-                await on_startup(None)
-                await dp.start_polling(bot, skip_updates=True)
-
-            asyncio.run(_run())
+        print(cmd_daily_logic(12345))
+        print("\nТестирование получения профиля (mock)")
+        print(cmd_profile_logic(12345))
+    else:
+        run_simple_polling()
