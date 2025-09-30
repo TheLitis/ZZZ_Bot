@@ -171,18 +171,36 @@ def test_daily(user_tg_id: int):
 
 # --- aiogram mode ---
 HAS_AIOGRAM = False
+EXECUTOR_AVAILABLE = False
 try:
     if BOT_TOKEN:
+        # try best-effort imports; aiogram versions differ in where executor lives
         from aiogram import Bot, Dispatcher, types
-        from aiogram.utils import executor
 
+        try:
+            # older beta: executor in aiogram.utils
+            from aiogram.utils import executor
+
+            EXECUTOR_AVAILABLE = True
+        except Exception:
+            try:
+                # some versions expose executor at top-level
+                from aiogram import executor  # type: ignore
+
+                EXECUTOR_AVAILABLE = True
+            except Exception:
+                EXECUTOR_AVAILABLE = False
         HAS_AIOGRAM = True
-        logger.info("aiogram available and BOT_TOKEN set — running in Telegram mode")
+        logger.info(
+            "aiogram detected — running in Telegram mode (executor available=%s)",
+            EXECUTOR_AVAILABLE,
+        )
     else:
         logger.info("BOT_TOKEN not set — aiogram will not be used")
 except Exception as e:
     logger.info("aiogram import failed: %s", e)
     HAS_AIOGRAM = False
+    EXECUTOR_AVAILABLE = False
 
 
 if not HAS_AIOGRAM:
@@ -459,4 +477,25 @@ else:
 
     if __name__ == "__main__":
         logger.info("Starting aiogram bot...")
-        executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+        # Prefer executor.start_polling if available (older aiogram). Otherwise use Dispatcher.start_polling
+        if EXECUTOR_AVAILABLE:
+            try:
+                executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+            except Exception as e:
+                logger.warning(
+                    "executor.start_polling failed: %s — falling back to dp.start_polling",
+                    e,
+                )
+
+                async def _run_fallback():
+                    await on_startup(None)
+                    await dp.start_polling(bot, skip_updates=True)
+
+                asyncio.run(_run_fallback())
+        else:
+
+            async def _run():
+                await on_startup(None)
+                await dp.start_polling(bot, skip_updates=True)
+
+            asyncio.run(_run())
